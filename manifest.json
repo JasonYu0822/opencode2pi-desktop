@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "local.opencode",
+  "id": "com.opencode2pi",
   "name": "OpenCode免费模型",
   "version": "0.4.0",
   "description": "OpenCode Zen 匿名免费模型接入 PI-Desktop 模型选择器：manifest 声明 provider（provider.register），后台服务在 127.0.0.1 起回环端点（background.service），以 opencode2dsh 的伪装请求头与免费通道门禁转发到 https://opencode.ai/zen。聊天通道走 chat_completions，Muse Spark 系列走 OpenAI Responses 通道。无需任何 API 密钥。",

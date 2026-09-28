@@ -30,7 +30,7 @@
   （`cost 0/0` 且未废弃），5 分钟刷新；列表变化时改写自己的 `manifest.json`，
   **在插件页重载一次插件**生效（宿主只在加载时读 manifest，与 commandcode 相同）。
 - **磁盘缓存**（`lib/zen.js` ModelCatalog）——S1 名单 + S2 元数据每次**真实变化**时
-  原子写入宿主数据目录 `~/.pi-desktop/plugins/data/local.opencode/catalog-cache.json`
+  原子写入宿主数据目录 `~/.pi-desktop/plugins/data/com.opencode2pi/catalog-cache.json`
   （`pi.plugin.getDataPath()`，拿不到则退回插件目录；7 天有效，只在数据真实变化时写——
   既不每 5 分钟落盘，也不在插件包目录里写，开发插件 watcher 永远看不到缓存文件）。
   启动先读盘播种再联网：离线/抖动启动直接沿用上次的
@@ -93,7 +93,7 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 | 步骤 | 工具 | 产物 |
 |---|---|---|
 | 校验 | `PluginCheck` | 按安装器同款规则报错/警告 |
-| 打包 | `PluginPack` | `dist/local.opencode-0.4.0.piplug`（store-only zip；`.git`/`node_modules`/`dist` 自动排除，<2000 文件、<50 MB、无符号链接） |
+| 打包 | `PluginPack` | `dist/com.opencode2pi-0.4.0.piplug`（store-only zip；`.git`/`node_modules`/`dist` 自动排除，<2000 文件、<50 MB、无符号链接） |
 | 安装 | 插件页 → 头部溢出菜单 → **「安装插件包」** | 选中 `.piplug` 文件即装（与「加载开发插件」的目录方式无关） |
 
 ### 权限说明
