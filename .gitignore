@@ -1,0 +1,23 @@
+# 构建产物（pnpm pi-plugin pack 产出）
+dist/
+*.piplug
+
+# 依赖
+node_modules/
+
+# manifest 自改写的临时文件（writeDeclaration 原子替换的中间文件）
+manifest.json.tmp
+*.tmp
+# 目录磁盘缓存（lib/zen.js 写，启动读；正常落在宿主数据目录，这里是退回插件目录的兜底）
+catalog-cache.json
+.catalog-cache.json
+
+
+# 日志
+*.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
