@@ -112,3 +112,4 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 - [pi-commandcode-desktop](https://github.com/eric8bit/pi-commandcode-desktop)（MIT），provider能力是参考它实现的。
 - [opencode2api](https://github.com/jasonxu114514/opencode2api)，上游匿名通道实现的源头，配享太庙。
 - [OpenCode](https://opencode.ai)，免费匿名 Zen 通道的提供方。
+- [LinuxDO](https://linux.do/)，感谢l站各位佬的帖子给了我灵感 ~~*（虽然具体是哪些帖子已经找不到了）*~~
