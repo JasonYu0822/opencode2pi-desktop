@@ -291,9 +291,12 @@ function handleRequest(req, res) {
 /**
  * Proxy one chat or Responses turn to Zen. Both dialects pass through
  * chunk by chunk — the shaping differs only in the body:
- *   chat      -> buildUpstreamBody (stream, reasoning_effort, bash/read gate)
- *   responses -> stream forced on, everything else untouched (muse-spark is
- *                served natively by Zen's own /v1/responses endpoint)
+ *   chat      -> stream, reasoning_effort normalized, bash/read gate
+ *   responses -> stream, bash/read gate (flat tool shape, no tool_choice)
+ *
+ * Both wires go through the gate: the anonymous lane checks the REQUEST BODY,
+ * not the endpoint, so /v1/responses is subject to it too. Getting this wrong
+ * 403s every Responses request. See issue #1.
  */
 async function handleUpstream(req, res, upstreamPath) {
   let hostBody;
@@ -306,14 +309,15 @@ async function handleUpstream(req, res, upstreamPath) {
     return;
   }
 
-  // Lane shaping — chat: force streaming, normalize reasoning_effort, inject
-  // the bash/read gate tools; responses: force streaming only (muse-spark is
-  // served natively by Zen's own /v1/responses). Everything else the host
-  // sent is forwarded untouched.
+  // Lane shaping — both wires force streaming and inject the bash/read gate
+  // tools; only the chat wire normalizes reasoning_effort, and the responses
+  // wire uses flat tool definitions with no tool_choice. Everything else the
+  // host sent is forwarded untouched.
   const isResponsesLane = upstreamPath.endsWith('/responses');
-  const body = isResponsesLane
-    ? { ...hostBody, stream: true }
-    : zen.buildUpstreamBody(hostBody);
+  const body = zen.buildUpstreamBody(
+    hostBody,
+    isResponsesLane ? zen.LANE.RESPONSES : zen.LANE.CHAT,
+  );
   const ids = zen.deriveRequestIDsFromWire(body);
 
   const controller = new AbortController();
