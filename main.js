@@ -355,18 +355,31 @@ async function handleUpstream(req, res, upstreamPath) {
       return;
     }
 
-    // SSE pass-through, chunk by chunk: both ends speak openai chat
-    // completions, so no re-encoding is needed and streaming is preserved.
-    res.writeHead(response.status, {
-      'Content-Type': response.headers.get('content-type') || 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
     if (!response.body) {
       res.end();
       return;
     }
     const upstream = Readable.fromWeb(response.body);
+
+    // The anonymous lane forces the upstream request to stream, but the host
+    // decides the response. A client that sent `stream: false` expects one JSON
+    // object; piping SSE fragments at it makes it fail to parse (issue #3).
+    if (hostBody.stream !== true) {
+      const text = await streamToString(upstream);
+      const payload = isResponsesLane
+        ? reassembleResponsesSse(text, hostBody.model)
+        : reassembleChatSse(text);
+      sendJson(res, 200, payload);
+      return;
+    }
+
+    // The host asked for a stream: pass it through chunk by chunk. Both ends
+    // speak the same dialect, so nothing is re-encoded.
+    res.writeHead(response.status, {
+      'Content-Type': response.headers.get('content-type') || 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
     upstream.on('error', () => {
       if (!res.writableEnded) res.end();
     });
@@ -383,6 +396,103 @@ async function handleUpstream(req, res, upstreamPath) {
       res.end();
     }
   }
+}
+
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    stream.on('error', reject);
+  });
+}
+
+/**
+ * Fold an upstream chat SSE stream back into one non-streaming chat.completion.
+ * The anonymous lane requires the request to stream, but a client that did not
+ * ask for a stream expects a single JSON object.
+ */
+function reassembleChatSse(raw) {
+  let id = '';
+  let created = 0;
+  let model = '';
+  let content = '';
+  let reasoning = '';
+  let finishReason = '';
+  let usage;
+  for (const line of raw.split('\n')) {
+    const data = line.startsWith('data:') ? line.slice(5).trim() : '';
+    if (!data || data === '[DONE]') continue;
+    let chunk;
+    try { chunk = JSON.parse(data); } catch { continue; }
+    if (!id) {
+      id = chunk.id || '';
+      created = chunk.created || 0;
+      model = chunk.model || '';
+    }
+    const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+    if (delta) {
+      if (typeof delta.content === 'string') content += delta.content;
+      if (typeof delta.reasoning === 'string') reasoning += delta.reasoning;
+    }
+    const reason = chunk.choices && chunk.choices[0] && chunk.choices[0].finish_reason;
+    if (reason) finishReason = reason;
+    if (chunk.usage && typeof chunk.usage === 'object') usage = chunk.usage;
+  }
+  // Some models put the whole answer in `reasoning` and leave `content` empty.
+  if (!content && reasoning) content = reasoning;
+  const message = { role: 'assistant', content };
+  if (reasoning && content) message.reasoning_content = reasoning;
+  const out = {
+    id: id || 'chatcmpl-proxy',
+    object: 'chat.completion',
+    created: created || Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, finish_reason: finishReason || 'stop' }],
+  };
+  if (usage) out.usage = usage;
+  return out;
+}
+
+/** Fold an upstream responses SSE stream back into one response object. */
+function reassembleResponsesSse(raw, model) {
+  let text = '';
+  let completed;
+  for (const line of raw.split('\n')) {
+    const data = line.startsWith('data:') ? line.slice(5).trim() : '';
+    if (!data || data === '[DONE]') continue;
+    let event;
+    try { event = JSON.parse(data); } catch { continue; }
+    if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+      text += event.delta;
+    } else if (event.type === 'response.completed' && event.response) {
+      completed = event.response;
+    }
+  }
+  if (completed) {
+    const output = Array.isArray(completed.output) ? completed.output : [];
+    const hasText = output.some((item) => Array.isArray(item && item.content)
+      && item.content.some((part) => part && part.type === 'output_text'));
+    if (!hasText) {
+      output.push({
+        type: 'message', role: 'assistant', status: 'completed',
+        content: [{ type: 'output_text', text }],
+      });
+      completed.output = output;
+    }
+    return completed;
+  }
+  return {
+    id: `resp_proxy_${Math.floor(Date.now() / 1000)}`,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed',
+    model: model || '',
+    output: [{
+      type: 'message', role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text }],
+    }],
+  };
 }
 
 /** Bind 127.0.0.1, preferring the fixed candidates so the manifest stays valid. */
