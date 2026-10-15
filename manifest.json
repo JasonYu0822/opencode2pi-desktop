@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "id": "com.opencode2pi",
   "name": "OpenCode免费模型",
-  "version": "0.5.3",
-  "description": "OpenCode Zen 匿名免费模型接入 PI-Desktop 模型选择器：manifest 声明 provider（provider.register），后台服务在 127.0.0.1 起回环端点（background.service），以 opencode2dsh 的伪装请求头与免费通道门禁转发到 https://opencode.ai/zen。聊天通道走 chat_completions，Muse Spark 系列走 OpenAI Responses 通道（0.5.1 起该通道同样补齐 bash/read 免费门禁工具；它只接受 tool_choice=auto，且要求非中国大陆出口）。上游默认自动走本机代理（插件设置 -> 环境变量 -> Windows 系统代理 -> 常见本地端口）；只要探测到代理候选就绝不直连——代理抖动时等待（400ms/900ms）并重拨同一个代理（最多 3 次），解析到的代理会被记住，直连只在一条代理候选都没有（或设置填 off）时使用；某个代理出口被地区门禁拒绝时改试下一个代理候选（0.5.3）。无需 API 密钥，也无需 TUN 或改系统 DNS 即可在中国大陆使用。",
+  "version": "0.5.4",
+  "description": "OpenCode Zen 匿名免费模型接入 PI-Desktop 模型选择器：manifest 声明 provider（provider.register），后台服务在 127.0.0.1 起回环端点（background.service），以官方客户端一致的伪装请求头与免费通道门禁转发到匿名免费端点 https://opencode.ai/inference（/zen/* 对无密钥请求已一律 403）。聊天通道走 chat_completions，Muse Spark 系列走 OpenAI Responses 通道（该通道同样补齐门禁工具、只接受 tool_choice=auto，且要求非中国大陆出口）。上游 2026-10-14 起按客户端指纹校验匿名请求：会话 id 必须是官方倒序时间戳编码、必须带 x-opencode-session-id、不得带 x-opencode-request、project 头必须是 40 位十六进制、tools 必须是官方定义（shell/edit/glob/grep/read，旧名 bash 会被丢），插件已逐项对齐（0.5.4）。上游默认自动走本机代理（插件设置 -> 环境变量 -> Windows 系统代理 -> 常见本地端口）；只要探测到代理候选就绝不直连——代理抖动时等待（400ms/900ms）并重拨同一个代理（最多 3 次），解析到的代理会被记住，直连只在一条代理候选都没有（或设置填 off）时使用；某个代理出口被地区门禁拒绝时改试下一个代理候选（0.5.3）。无需 API 密钥，也无需 TUN 或改系统 DNS 即可在中国大陆使用。",
   "main": "main.js",
   "permissions": [
     "provider.register",

@@ -134,14 +134,23 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 ## 工作原理（请求链路全部在 `lib/zen.js` + `lib/transport.js`）
 
 - **CLI 一致的伪装头**——`user-agent: opencode/1.18.31 (…)`、`x-opencode-client: cli`，
-  会话/请求/项目三族关联头；session id 为 OpenCode 规范形状 `ses_+12hex+14base62`
-  （免费通道 403 门禁的形状校验），按**对话首条用户消息**派生、同一对话稳定。
-- **免费通道体门禁（两条 lane 都要）**——请求体必须流式，且 tools 里必须有名为 `bash`、
-  `read` 的函数工具（实测 2026-10-08 在 `/v1/responses` 上重新确认：缺任一个就是
-  `403 FreeTierError: OpenCode's free tier can only be used from within OpenCode`）。
-  chat 通道：纯对话补 `tool_choice: "none"`，已有真实工具则只补齐缺失项；responses 通道：
-  门禁工具用扁平形状，且**不写 `tool_choice`**——该通道只接受 `"auto"`，写 `"none"` 会被
-  `400 only "auto" is supported for tool_choice` 拒绝。已有工具时两条 lane 都只补齐缺失项。
+  会话/请求/项目三族关联头；session id 为 OpenCode 规范形状 `ses_+12hex+14base62`，
+  且那 12 位十六进制必须是官方**倒序时间戳**编码（低 12 位落在 `0xFC0–0xFFF`，正则
+  `^[0-9a-f]{9}f[c-f][0-9a-f]$`），编码取自对话首条用户消息的哈希、同一对话稳定。
+- **免费通道请求形状（两条 lane 都要；上游 2026-10-14 收紧过，0.5.4 已按新规则对齐）**——
+  匿名免费流量走 `https://opencode.ai/inference`（`/zen/*` 现在对无密钥请求一律
+  `403 FreeTierError`），而且上游会逐项核对"你是不是官方客户端"：
+  - 请求体必须流式；
+  - tools 里必须有**官方定义**的 `shell`、`edit`、`glob`、`grep`、`read`（描述与参数
+    schema 逐字节一致，`lib/opencode-tools.json` 就是原样内嵌的那一份）；空壳桩会被拒；
+    旧名 `bash`（客户端 2026-07 已改名 `shell`）会被直接丢掉——留着它整条请求必 403；
+  - 头必须同时带 `x-opencode-session` 与 `x-opencode-session-id`，**不能**带
+    `x-opencode-request`，`x-opencode-project` 必须是非规范形态的 40 位十六进制；
+  - `Authorization: Bearer public` 保留（删掉或大小写写错都会被拒）。
+  chat 通道：纯对话补 `tool_choice: "none"`；responses 通道：工具用扁平形状，且**不写
+  `tool_choice`**（该通道只接受 `"auto"`，写 `"none"` 会被 `400 only "auto" is supported`
+  拒绝）。宿主自己的工具（`Read`/`Bash`…）原样透传——上游不认这些名字；门禁再变时，
+  按同一思路重测（对比 `/inference` 与 `/zen`，再逐项开关头/工具/会话 id），不要猜。
 - **思考档位归一**——档位由宿主写（宿主读取声明的 `thinkingLevels` 生成菜单并写入
   `reasoning_effort`），代理层把 `off`/缺失/非法值规范成 `"none"`（该通道唯一能真正
   关掉 always-think 模型的写法），合法档位原样透传。
@@ -189,6 +198,6 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 
 - [opencode2dsh](https://github.com/FishBottle7/opencode2dsh)（MIT，© FishBottle7），没有它我就不会想到可以这么弄。
 - [pi-commandcode-desktop](https://github.com/eric8bit/pi-commandcode-desktop)（MIT），provider能力是参考它实现的。
-- [opencode2api](https://github.com/jasonxu114514/opencode2api)，上游匿名通道实现的源头，配享太庙。
+- [opencode2api](https://github.com/jasonxu114514/opencode2api)，上游匿名通道实现的源头，配享太庙；它 2026-10-14 那轮"镜像官方客户端指纹"的修复（端点、会话 id 编码、头集合、官方工具定义）是 0.5.4 的直接依据，`lib/opencode-tools.json` 内嵌的定义即取自其镜像的官方客户端定义（描述与参数 schema 逐字节保留）。
 - [OpenCode](https://opencode.ai)，免费匿名 Zen 通道的提供方。
 - [LinuxDO](https://linux.do/)，感谢l站各位佬的帖子给了我灵感 ~~*（虽然具体是哪些帖子已经找不到了）*~~。

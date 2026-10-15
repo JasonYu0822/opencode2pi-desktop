@@ -492,13 +492,17 @@ async function handleUpstream(req, res, upstreamPath) {
     return;
   }
   try {
-    const response = await upstreamFetch(`${zen.ZEN_BASE_URL}${upstreamPath}`, {
+    // The free lanes live on the anonymous endpoint since 2026-10-14; /zen is
+    // the keyed path now and answers 403 FreeTierError for keyless requests.
+    const response = await upstreamFetch(`${zen.ANONYMOUS_BASE_URL}${upstreamPath}`, {
       method: 'POST',
       headers: {
         ...zen.disguiseHeaders(ids),
         authorization: `Bearer ${zen.ANONYMOUS_KEY}`,
         'content-type': 'application/json',
-        accept: 'text/event-stream',
+        // The client's own Accept spelling — the anonymous lane is strict about
+        // the request shape it fingerprints (see lib/zen.js ANONYMOUS_BASE_URL).
+        accept: 'application/json, text/event-stream',
       },
       body: JSON.stringify(body),
       signal: controller.signal,
