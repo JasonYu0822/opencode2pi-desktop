@@ -50,6 +50,17 @@ const COMMANDS = {
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const UPSTREAM_HEADER_TIMEOUT_MS = 60_000;
 
+/**
+ * A live SSE stream is never silent: Zen emits `: keep-alive` comments while a
+ * model is thinking. A gap this long therefore means the connection is dead,
+ * and aborting beats letting the host wait forever on a stalled upstream.
+ *
+ * 真实的 SSE 流不会静默：模型思考期间 Zen 会持续发送 `: keep-alive` 注释行，
+ * 因此出现这么长的空档就意味着连接已死；主动中止，好过让宿主无限等待一个卡住的
+ * 上游。
+ */
+const UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+
 let pi;
 let packageRoot = '';
 /** Host per-plugin data dir (pi.plugin.getDataPath); packageRoot is fallback. */
@@ -356,7 +367,15 @@ async function handleUpstream(req, res, upstreamPath) {
     }
 
     // SSE pass-through, chunk by chunk: both ends speak openai chat
-    // completions, so no re-encoding is needed and streaming is preserved.
+    // completions, so no re-encoding is needed. The relay only *inspects* the
+    // bytes, so it can guarantee a terminal frame: a stream that ends without
+    // `[DONE]` (or with an error) otherwise leaves the host guessing, which on
+    // the compaction lane surfaces as an unexplained failure instead of a
+    // retryable error.
+    // 逐块透传 SSE：两端都讲 openai chat completions，因此无需重新编码。中继只
+    // “检视”字节，从而能保证一个终止帧：若流在缺少 `[DONE]`（或带错误）的情况下
+    // 结束，宿主只能靠猜；这在压缩（compaction）路径上会表现为一次没有任何解释的
+    // 失败，而不是一个可重试的错误。
     res.writeHead(response.status, {
       'Content-Type': response.headers.get('content-type') || 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -366,12 +385,73 @@ async function handleUpstream(req, res, upstreamPath) {
       res.end();
       return;
     }
+
+    // Relay state: whether the client has left, which terminal markers upstream
+    // actually sent, and a rolling tail so a marker split across chunks still
+    // matches. `finish()` is the single exit point and always ends the response.
+    // 中继状态：客户端是否已断开、上游究竟发出了哪些终止标记，以及一个滚动尾巴，
+    // 使被拆到相邻分块的标记也能匹配。`finish()` 是唯一出口，且总会结束响应。
     const upstream = Readable.fromWeb(response.body);
-    upstream.on('error', () => {
-      if (!res.writableEnded) res.end();
+    let clientGone = false;
+    let sawDone = false;
+    let sawFinish = false;
+    let tailProbe = '';
+    let idleTimer = null;
+    const armIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (!clientGone) {
+          state.lastError = `upstream was silent for ${UPSTREAM_IDLE_TIMEOUT_MS}ms`;
+          log(state.lastError);
+          controller.abort();
+        }
+      }, UPSTREAM_IDLE_TIMEOUT_MS);
+    };
+    const finish = (errorMessage) => {
+      clearTimeout(idleTimer);
+      if (clientGone || res.writableEnded) return;
+      // Neither `[DONE]` nor `finish_reason` means the upstream never completed
+      // the turn (dead connection, or an edge that simply stops talking). Report
+      // that as a retryable error instead of a silent, content-free success.
+      // 既没有 `[DONE]` 也没有 `finish_reason`，说明上游从未真正完成本轮（连接已
+      // 死，或某个边缘节点干脆不再说话）。把它作为可重试的错误上报，而不是当成一次
+      // 静默且无内容的“成功”。
+      if (!sawDone && !sawFinish) {
+        const message = errorMessage ?? 'upstream closed the stream before completing';
+        res.write(`data: ${JSON.stringify({ error: { message, type: 'upstream_error' } })}\n\n`);
+      }
+      if (!sawDone) res.write('data: [DONE]\n\n');
+      res.end();
+    };
+
+    res.on('close', () => {
+      clientGone = true;
+      clearTimeout(idleTimer);
+      upstream.destroy();
     });
-    res.on('close', () => upstream.destroy());
-    upstream.pipe(res);
+
+    armIdle();
+    try {
+      for await (const chunk of upstream) {
+        armIdle();
+        const text = chunk.toString('utf8');
+        // Rolling tail: markers split across chunk boundaries still match.
+        // 滚动尾巴：即使标记被拆到相邻分块之间也能匹配。
+        tailProbe = (tailProbe + text).slice(-160);
+        if (tailProbe.includes('[DONE]')) sawDone = true;
+        if (/"finish_reason"\s*:\s*"[a-z_]+"/.test(text)) sawFinish = true;
+        if (!res.write(chunk) && !clientGone) {
+          await new Promise((resolve) => res.once('drain', resolve));
+        }
+      }
+      finish(null);
+    } catch (error) {
+      const reason = error && error.message ? error.message : String(error);
+      state.errors += 1;
+      state.lastError = `upstream stream interrupted: ${reason}`;
+      log(state.lastError);
+      finish(`upstream stream interrupted: ${reason}`);
+    }
   } catch (error) {
     clearTimeout(headerTimer);
     state.errors += 1;

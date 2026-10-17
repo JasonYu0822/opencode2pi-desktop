@@ -5,7 +5,33 @@
 
 *本插件完全由AI生成，不保证完全可用。*有问题欢迎提交issue，*~~我会拿AI修的~~*。
 
-## 架构（v0.4）
+## 架构（v0.5.1）
+
+**v0.5.1（2026-10-18）修复：**
+- **SSE 中途死亡不再静默截断**：回环端点原本是纯 `pipe` 透传，上游在流已开始之后
+  断开时只做 `res.end()`，宿主看到的是"流意外结束"（在自动压缩这类长请求上就表现为
+  压缩失败）。现在中继只**检查**字节流、不改内容：上游若在给出
+  `finish_reason` 或 `[DONE]` 之前结束/断开，就补发一条 `upstream_error` 错误帧
+  加 `[DONE]` 终止符，让宿主拿到可重试的明确错误；另加 **120s 上游空闲看门狗**
+  （Zen 在思考时会持续发 `: keep-alive` 注释，所以真静默即连接已死）。
+
+**v0.5（2026-10-17）修复：**
+- **403 FreeTierError 根因**（opencode2dsh #62, 2026-10-13 上游门禁变更）：免费通道现在
+  校验 `ses_` 会话 id 的前 12 位十六进制必须是一个**真实时钟**（OpenCode 官方
+  `~(ms*0x1000+counter)` 位反转），digest 派生的时间段约 85% 概率被拒。现在与
+  opencode2dsh 0.3.12 一致：按对话种子**记忆化**铸造会话 id（同一对话/重试复用，
+  保留配额与提示缓存亲和）。
+- **`reasoning_effort` 不再默认注入 `"none"`**：上游按模型校验 effort 词表
+  （big-pickle 等只认 low/medium/high/xhigh，默认请求被 400）。现在宿主未选思考
+  档位就**完全省略该字段**；显式选 off 才写 `none`（仅对支持它的模型有效）。
+- **免费通道封锁名单**（opencode2dsh #56）：`ling-3.0-flash-fin-free`（400
+  不可用）、`muse-spark-1.*-contributor-free`（本区域 403 RegionError，chat 与
+  responses 双通道）、`exo-free`（410）、`jev-1.13-free`（SystemOne-only）不进
+  模型选择器；Muse Spark 的 responses provider 声明随之移除（恢复后重新加回）。
+- 静态清单刷新为 2026-10 实测在用的 10 个聊天模型；`mimo-v2.6-flash-free` 上下文
+  按 MiMo 官方卡片修正为 1048576（models.dev 误报 200000）。
+
+### 原 v0.4 说明
 
 宿主在**生成插件进程之前**就读取 manifest 的 `contributes.providers`，聊天窗的模型
 选择器只枚举这个宿主 provider 列表——运行时 `registerProvider` 的模型（agent 扩展）
@@ -71,9 +97,12 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 - **免费通道体门禁**——请求体必须流式，且 tools 含名为 `bash`、`read` 的占位工具；
   纯对话时补 `tool_choice: "none"`，已有真实工具则只补齐缺失项。
 - **思考档位归一**——档位由宿主写（宿主读取声明的 `thinkingLevels` 生成菜单并写入
-  `reasoning_effort`），代理层把 `off`/缺失/非法值规范成 `"none"`（该通道唯一能真正
-  关掉 always-think 模型的写法），合法档位原样透传。
-- **SSE 逐块透传**——两端都是 openai chat completions 方言，无需重编码，流式零损耗。
+  `reasoning_effort`）。代理层规则（v0.5 起）：宿主没给值就**完全省略**该字段（走厂商
+  默认，避免 big-pickle 这类只认 low/medium/high 的模型被 400）；显式 `off`/`none`
+  才写 `"none"`（该通道唯一能真正关掉 always-think 模型的写法）；合法档位原样透传，
+  无法识别的值一律不注入，不做冒险猜测。
+- **SSE 逐块透传 + 终止帧保证**——两端都是 openai chat completions 方言，无需重编码，
+  流式零损耗；中继额外保证任何上游死亡都收敛为「错误帧 + `[DONE]`」，不产生静默截断。
 - 未移植（有意为之）：IP 池/代理轮换子系统（配额规避）、legacy Go sidecar。
 
 > 匿名通道按 **IP** 限速，是 OpenCode 提供的免费入口，请合理使用；429/403 错误会原样呈现。
