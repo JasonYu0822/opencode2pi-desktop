@@ -31,6 +31,37 @@ function upstreamSse(text, headers = {}) {
   });
 }
 
+function transportStyleSse(text, headers = {}) {
+  const raw = {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'x-request-id': 'transport-request',
+    ...headers,
+  };
+  const bytes = Buffer.from(text);
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: {
+      get(name) {
+        const value = raw[String(name).toLowerCase()];
+        return Array.isArray(value) ? value.join(', ') : value ?? null;
+      },
+      raw,
+    },
+    body: new ReadableStream({
+      start(controller) {
+        for (let offset = 0; offset < bytes.length; offset += 7) {
+          controller.enqueue(bytes.subarray(offset, offset + 7));
+        }
+        controller.close();
+      },
+    }),
+    text: async () => text,
+    json: async () => JSON.parse(text),
+  };
+}
+
 async function withProxy(upstreamFetch, run) {
   const server = http.createServer((req, res) => {
     const path = req.url.endsWith('/responses') ? '/v1/responses' : '/v1/chat/completions';
@@ -49,6 +80,31 @@ async function withProxy(upstreamFetch, run) {
     await new Promise((resolve) => server.close(resolve));
   }
 }
+
+test('proxy accepts the header shape returned by the built-in transport', async () => {
+  await withProxy(async () => transportStyleSse(
+    event({
+      id: 'chat-transport',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }],
+    })
+    + event('[DONE]'),
+  ), async (base) => {
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'beam-free',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-request-id'), 'transport-request');
+    const body = await response.json();
+    assert.equal(body.choices[0].message.content, 'ok');
+  });
+});
 
 test('proxy aggregates a non-streaming Chat reply and maps split tool names', async () => {
   let upstreamBody;

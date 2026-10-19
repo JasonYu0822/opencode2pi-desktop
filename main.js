@@ -470,10 +470,23 @@ const DROPPED_UPSTREAM_HEADERS = new Set([
   'upgrade',
 ]);
 
+function forEachHeader(headers, callback) {
+  if (typeof headers?.forEach === 'function') {
+    headers.forEach(callback);
+    return;
+  }
+  const source = headers?.raw && typeof headers.raw === 'object' ? headers.raw : headers;
+  if (!source || typeof source !== 'object') return;
+  for (const [key, value] of Object.entries(source)) {
+    if (value == null) continue;
+    callback(Array.isArray(value) ? value.join(', ') : String(value), key);
+  }
+}
+
 /** Copy end-to-end upstream headers without stale framing or content metadata. */
 function forwardedHeaders(response, contentType) {
   const headers = {};
-  response.headers.forEach((value, key) => {
+  forEachHeader(response.headers, (value, key) => {
     if (!DROPPED_UPSTREAM_HEADERS.has(key.toLowerCase())) headers[key] = value;
   });
   headers['Content-Type'] = contentType || response.headers.get('content-type') || 'application/json';

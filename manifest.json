@@ -66,21 +66,6 @@
         "authKind": "none",
         "models": [
           {
-            "id": "big-pickle",
-            "name": "big-pickle",
-            "contextWindow": 200000,
-            "maxTokens": 32000,
-            "supportsImages": false,
-            "thinkingLevels": [
-              "off",
-              "minimal",
-              "low",
-              "medium",
-              "high"
-            ],
-            "defaultThinkingLevel": "medium"
-          },
-          {
             "id": "beam-free",
             "name": "beam-free",
             "contextWindow": 1048576,
@@ -92,6 +77,21 @@
               "high",
               "xhigh",
               "max"
+            ],
+            "defaultThinkingLevel": "medium"
+          },
+          {
+            "id": "big-pickle",
+            "name": "big-pickle",
+            "contextWindow": 200000,
+            "maxTokens": 32000,
+            "supportsImages": false,
+            "thinkingLevels": [
+              "off",
+              "minimal",
+              "low",
+              "medium",
+              "high"
             ],
             "defaultThinkingLevel": "medium"
           },
@@ -113,7 +113,7 @@
             "name": "glm-5.3-flash-free",
             "contextWindow": 200000,
             "maxTokens": 32000,
-            "supportsImages": false,
+            "supportsImages": true,
             "thinkingLevels": [
               "low",
               "high",
@@ -174,11 +174,11 @@
             "supportsImages": true,
             "thinkingLevels": [
               "off",
+              "minimal",
               "low",
               "medium",
               "high",
-              "xhigh",
-              "max"
+              "xhigh"
             ],
             "defaultThinkingLevel": "medium"
           },
