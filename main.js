@@ -63,6 +63,12 @@ const COMMANDS = {
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const UPSTREAM_HEADER_TIMEOUT_MS = 60_000;
 /**
+ * Zen emits `: keep-alive` comments while a model is thinking. A live stream
+ * therefore never stays silent for this long; aborting turns a dead socket
+ * into a retryable error instead of an indefinite host wait.
+ */
+const UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+/**
  * How long the transport may spend waiting out failed proxy dials before it
  * reports `ENOROUTE`. Deliberately below the header timeout above, so the chat
  * error carries the transport's own explanation instead of a bare abort.
@@ -442,11 +448,11 @@ function handleRequest(req, res) {
 }
 
 /**
- * Proxy one chat or Responses turn to Zen. Both dialects pass through
- * chunk by chunk — the shaping differs only in the body:
- *   chat      -> buildUpstreamBody (stream, reasoning_effort, bash/read gate)
- *   responses -> stream forced on, everything else untouched (muse-spark is
- *                served natively by Zen's own /v1/responses endpoint)
+ * Proxy one chat or Responses turn to Zen. Streaming responses pass through
+ * chunk by chunk; non-streaming responses are reassembled into one JSON
+ * document. The request shaping differs by dialect:
+ *   chat      -> stream, reasoning_effort normalization, official tool gate
+ *   responses -> stream, flat official tools, no tool_choice
  */
 async function handleUpstream(req, res, upstreamPath) {
   let hostBody;
@@ -460,9 +466,7 @@ async function handleUpstream(req, res, upstreamPath) {
   }
 
   // Lane shaping — both lanes force streaming and satisfy the free-lane body
-  // gate (function tools named bash AND read; re-probed on /v1/responses
-  // 2026-10-08, where the same FreeTierError appeared until the gate tools were
-  // present):
+  // gate with the official client tool definitions:
   //   chat      -> buildUpstreamBody (stream, reasoning_effort, gate tools)
   //   responses -> the gate tools in the flat Responses shape, and no
   //                tool_choice override: that provider only accepts "auto"
@@ -541,18 +545,74 @@ async function handleUpstream(req, res, upstreamPath) {
       return;
     }
 
-    // The host asked for a stream: pass it through chunk by chunk. Both ends
-    // speak the same dialect, so nothing is re-encoded.
+    // The host asked for a stream: pass it through chunk by chunk. The relay
+    // inspects bytes without rewriting them so a dead upstream still produces
+    // an explicit error frame and a terminal [DONE] marker.
     res.writeHead(response.status, {
       'Content-Type': response.headers.get('content-type') || 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
     });
-    upstream.on('error', () => {
-      if (!res.writableEnded) res.end();
+    let clientGone = false;
+    let sawDone = false;
+    let sawFinish = false;
+    let sawResponseCompleted = false;
+    let tailProbe = '';
+    let idleTimer = null;
+    const armIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (clientGone) return;
+        state.lastError = `upstream was silent for ${UPSTREAM_IDLE_TIMEOUT_MS}ms`;
+        log(state.lastError);
+        controller.abort();
+      }, UPSTREAM_IDLE_TIMEOUT_MS);
+    };
+    const finish = (errorMessage) => {
+      clearTimeout(idleTimer);
+      if (clientGone || res.writableEnded) return;
+      if (!sawDone && !sawFinish && !sawResponseCompleted) {
+        const message = errorMessage ?? 'upstream closed the stream before completing';
+        res.write(`data: ${JSON.stringify({ error: { message, type: 'upstream_error' } })}\n\n`);
+      }
+      if (!sawDone && !sawResponseCompleted) res.write('data: [DONE]\n\n');
+      res.end();
+    };
+    const waitForDrain = () => new Promise((resolve) => {
+      const done = () => {
+        res.off('drain', done);
+        res.off('close', done);
+        resolve();
+      };
+      res.once('drain', done);
+      res.once('close', done);
     });
-    res.on('close', () => upstream.destroy());
-    upstream.pipe(res);
+
+    res.on('close', () => {
+      clientGone = true;
+      clearTimeout(idleTimer);
+      upstream.destroy();
+    });
+
+    armIdle();
+    try {
+      for await (const chunk of upstream) {
+        armIdle();
+        const text = chunk.toString('utf8');
+        tailProbe = (tailProbe + text).slice(-160);
+        if (tailProbe.includes('[DONE]')) sawDone = true;
+        if (/"finish_reason"\s*:\s*"[a-z_]+"/.test(tailProbe)) sawFinish = true;
+        if (/"type"\s*:\s*"response\.completed"/.test(tailProbe)) sawResponseCompleted = true;
+        if (!res.write(chunk) && !clientGone) await waitForDrain();
+      }
+      finish(null);
+    } catch (error) {
+      const reason = error && error.message ? error.message : String(error);
+      state.errors += 1;
+      state.lastError = `upstream stream interrupted: ${reason}`;
+      log(state.lastError);
+      finish(`upstream stream interrupted: ${reason}`);
+    }
   } catch (error) {
     clearTimeout(headerTimer);
     // Keep the underlying cause: a bare `fetch failed` is undiagnosable (it is

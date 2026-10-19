@@ -5,7 +5,17 @@
 
 *本插件完全由AI生成，不保证完全可用。*有问题欢迎提交issue，*~~我会拿AI修的~~*。
 
-## 架构（v0.5）
+## 架构（v0.5.5）
+
+**v0.5.5（合并 PR #5、#7）修复：**
+- **非流式响应**：宿主发送 `stream: false` 时，代理不再把 SSE 碎片原样返回，
+  而是分别按 chat 与 Responses 方言重新组装成单个完整 JSON；流式请求仍逐块透传。
+- **会话 id**：12 位十六进制时间段改为按对话记忆化的真实倒序时钟，同一对话的重试
+  与后续轮次继续复用同一个 `ses_` id，并保留上游配额归组与提示缓存亲和。
+- **思考档位**：宿主未选择档位时完全省略 `reasoning_effort`；只有显式 `off`/`none`
+  才写成 `"none"`，避免 `big-pickle` 等模型因缺失档位被上游 400。
+- **流终止保证**：流式中继只检视字节、不改内容；上游在给出 `finish_reason`/`[DONE]`
+  前断开时补发 `upstream_error` 错误帧与 `[DONE]`，并增加 120s 空闲看门狗。
 
 宿主在**生成插件进程之前**就读取 manifest 的 `contributes.providers`，聊天窗的模型
 选择器只枚举这个宿主 provider 列表——运行时 `registerProvider` 的模型（agent 扩展）
@@ -17,7 +27,7 @@
         └─ baseUrl http://127.0.0.1:41860/v1 ──► 插件后台服务 zen-proxy（loopback）
                                                      │  附加伪装头 + 体门禁 + Bearer public
                                                      │  上游连接由 lib/transport.js 建立（代理走 CONNECT/SOCKS5）
-                                                     └─► https://opencode.ai/zen/v1/chat/completions (SSE 逐块透传)
+                                                     └─► https://opencode.ai/inference (SSE 逐块透传)
 ```
 
 - **`provider.register`**——把 manifest 声明的服务与模型加进设置的服务列表（即模型
@@ -136,7 +146,8 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 - **CLI 一致的伪装头**——`user-agent: opencode/1.18.31 (…)`、`x-opencode-client: cli`，
   会话/请求/项目三族关联头；session id 为 OpenCode 规范形状 `ses_+12hex+14base62`，
   且那 12 位十六进制必须是官方**倒序时间戳**编码（低 12 位落在 `0xFC0–0xFFF`，正则
-  `^[0-9a-f]{9}f[c-f][0-9a-f]$`），编码取自对话首条用户消息的哈希、同一对话稳定。
+  `^[0-9a-f]{9}f[c-f][0-9a-f]$`）。时间部分按对话记忆化铸造为真实倒序时钟，
+  同一对话的重试与后续轮次继续复用同一个会话。
 - **免费通道请求形状（两条 lane 都要；上游 2026-10-14 收紧过，0.5.4 已按新规则对齐）**——
   匿名免费流量走 `https://opencode.ai/inference`（`/zen/*` 现在对无密钥请求一律
   `403 FreeTierError`），而且上游会逐项核对"你是不是官方客户端"：
@@ -152,10 +163,10 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
   拒绝）。宿主自己的工具（`Read`/`Bash`…）原样透传——上游不认这些名字；门禁再变时，
   按同一思路重测（对比 `/inference` 与 `/zen`，再逐项开关头/工具/会话 id），不要猜。
 - **思考档位归一**——档位由宿主写（宿主读取声明的 `thinkingLevels` 生成菜单并写入
-  `reasoning_effort`），代理层把 `off`/缺失/非法值规范成 `"none"`（该通道唯一能真正
-  关掉 always-think 模型的写法），合法档位原样透传。
-- **SSE 逐块透传**——两端都是 openai chat completions 方言，无需重编码，流式零损耗
-  （`response.body` 是普通 Node 流，直接 `pipe` 给宿主）。
+  `reasoning_effort`）。未选择时完全省略该字段；只有显式 `off`/`none` 才写
+  `"none"`；合法档位原样透传，非法值不注入。
+- **流式与非流式响应**——`stream: true` 时逐块透传，并在上游异常结束时补发
+  `upstream_error` 与 `[DONE]`；`stream: false` 时把上游 SSE 重新组装成完整 JSON。
 - **连接层**（`lib/transport.js` + `lib/proxy.js`）——代理隧道 / 直连 / 公共 DNS 兜底，
   见上文「上游代理」。
 - 未移植（有意为之）：IP 池/代理轮换子系统（配额规避）、legacy Go sidecar。
