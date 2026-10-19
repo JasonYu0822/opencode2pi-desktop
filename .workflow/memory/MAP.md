@@ -14,8 +14,8 @@ batchRef: 2088b909
 - main.js —— 回环端点 127.0.0.1:41860/41861/41862（GET /healthz、POST /v1/chat/completions、POST /v1/responses、GET|POST /proxy、GET /v1/models）、命令 opencode.status / opencode.refresh、插件设置 proxyUrl、UPSTREAM_HEADER_TIMEOUT_MS=60s、把 ENOROUTE 等错误变成 502 文本。
 - lib/proxy.js —— 候选解析（插件设置 -> env -> Windows 系统代理 reg.exe -> 常见端口探测）、http CONNECT / SOCKS5 隧道（openTunnel / checkCandidate）、DIRECT_SENTINELS / AUTO_SENTINELS / parseProxyUrl、forcedDirect。
 - lib/transport.js —— 路由与重试（dialList / dialPlan / walk / orderCandidates、heldProxies、proxyStrikes + 60s 冷却）；state() 暴露 candidates / proxiesOnly / planned / active / notes / failures / lastError / counters{requests,retries,waits,dnsRetries,resolutions,regionRetries}。
-- lib/zen.js —— 伪装头（user-agent opencode/1.18.31、x-opencode-client: cli、ses_+12hex+14base62）、免费门禁（tools 必含 bash+read；responses 用扁平工具且不写 tool_choice）、模型目录 S1(zen)∩S2(models.dev) + 静态兜底 + catalog-cache.json。
-- manifest.json —— contributes.providers 两个 provider：opencode-free（chat_completions）与 opencode-free-responses（responses），authKind 均为 none，vendorKey 均为 opencode，baseUrl 均指向回环端点；contributes.settings = proxyUrl。
+- lib/zen.js —— 伪装头（user-agent opencode/1.18.31、x-opencode-client: cli、ses_+12hex+14base62）、免费门禁（tools 必含 shell/edit/glob/grep/read；responses 用扁平工具且不写 tool_choice）、模型目录 S1(zen)∩S2(models.dev)、协议目录/文档分流 + 静态兜底 + catalog-cache.json。
+- manifest.json —— contributes.providers 初始声明 opencode-free（chat_completions）；发现 Responses 协议的免费模型时动态追加 opencode-free-responses，authKind 均为 none，vendorKey 均为 opencode，baseUrl 均指向回环端点；contributes.settings = proxyUrl。
 
 宿主侧（D:\Codes\PI-Desktop，只读参考）：
 - crates/host-core/src/plugins/providers.rs —— manifest -> providers 行的 sync_plugin_providers / reconcile_plugin / reconcile_all。

@@ -5,17 +5,22 @@
 
 *本插件完全由AI生成，不保证完全可用。*有问题欢迎提交issue，*~~我会拿AI修的~~*。
 
-## 架构（v0.5.5）
+## 架构
 
-**v0.5.5（合并 PR #5、#7）修复：**
-- **非流式响应**：宿主发送 `stream: false` 时，代理不再把 SSE 碎片原样返回，
-  而是分别按 chat 与 Responses 方言重新组装成单个完整 JSON；流式请求仍逐块透传。
+**近期修复：**
+- **协议感知的响应处理**：宿主发送 `stream: false` 时，按 Chat 或 Responses
+  方言完整聚合 SSE；流式请求按事件帧解析、校验并只重写需要修正的帧。
+- **增量 SSE 解析**：支持 BOM、注释、CRLF/CR/LF、多行 `data:`、任意字节切块和 UTF-8 校验，
+  不再用字符串包含关系猜测完成标记。
+- **工具调用守卫**：Chat 的分片工具名先缓冲后统一映射；Responses 在 item 与最终快照中同步映射，
+  未声明的空名调用会转成可读提示，不会留下半截调用。
 - **会话 id**：12 位十六进制时间段改为按对话记忆化的真实倒序时钟，同一对话的重试
   与后续轮次继续复用同一个 `ses_` id，并保留上游配额归组与提示缓存亲和。
 - **思考档位**：宿主未选择档位时完全省略 `reasoning_effort`；只有显式 `off`/`none`
   才写成 `"none"`，避免 `big-pickle` 等模型因缺失档位被上游 400。
-- **流终止保证**：流式中继只检视字节、不改内容；上游在给出 `finish_reason`/`[DONE]`
-  前断开时补发 `upstream_error` 错误帧与 `[DONE]`，并增加 120s 空闲看门狗。
+- **流终止保证**：只有 Chat 的 `[DONE]` 与 Responses 的 `response.completed` /
+  `response.incomplete` 才算终止；文本已输出且无未完成工具时会补截断提示，
+  其余异常结束会返回明确错误。另保留 120s 空闲看门狗。
 
 宿主在**生成插件进程之前**就读取 manifest 的 `contributes.providers`，聊天窗的模型
 选择器只枚举这个宿主 provider 列表——运行时 `registerProvider` 的模型（agent 扩展）
@@ -27,7 +32,7 @@
         └─ baseUrl http://127.0.0.1:41860/v1 ──► 插件后台服务 zen-proxy（loopback）
                                                      │  附加伪装头 + 体门禁 + Bearer public
                                                      │  上游连接由 lib/transport.js 建立（代理走 CONNECT/SOCKS5）
-                                                     └─► https://opencode.ai/inference (SSE 逐块透传)
+                                                     └─► https://opencode.ai/inference (SSE 解析/重写/聚合)
 ```
 
 - **`provider.register`**——把 manifest 声明的服务与模型加进设置的服务列表（即模型
@@ -37,7 +42,7 @@
   127.0.0.1，拒绝非回环 Host/Origin）。宿主把请求发到 baseUrl，本进程用
   `lib/transport.js` 转发上游并逐块透传 SSE（不能用宿主的 `net.fetch` 桥——它会把
   响应缓冲成整段文本，流式就没了；也因此不申请 `net.fetch` 权限）。
-- **上游代理（v0.5）**——宿主给插件子进程的是**白名单环境变量**（只有 PATH、SystemRoot、
+- **上游代理**——宿主给插件子进程的是**白名单环境变量**（只有 PATH、SystemRoot、
   TEMP 等，不含 `HTTP_PROXY`/`HTTPS_PROXY`/`NODE_USE_ENV_PROXY`），且插件进程的原生
   `fetch` 不读系统代理。于是直连时用的是系统解析器：在 `opencode.ai` 被 DNS 污染的网络里
   每次对话都是 502 `upstream request failed: fetch failed`（真因 `ERR_TLS_CERT_ALTNAME_INVALID`
@@ -51,10 +56,10 @@
   既不每 5 分钟落盘，也不在插件包目录里写，开发插件 watcher 永远看不到缓存文件）。
   启动先读盘播种再联网：离线/抖动启动直接沿用上次的
   完整清单与元数据，不会退化成静态兜底去改写 manifest（也就没有"列表缩水 + 思考
-  档消失 + 无谓重载"）。缓存缺失/过期/损坏时退回编译期静态清单（当前 = 实测在用的
-  8 个 chat + 2 个 responses），首次离线加载同样可用。
+  档消失 + 无谓重载"）。缓存缺失/过期/损坏时退回编译期静态清单；Responses
+  模型由协议目录发现后动态声明，当前目录若没有对应免费模型则不生成该 provider。
 
-## 上游代理（v0.5）：只影响本插件，不动系统
+## 上游代理：只影响本插件，不动系统
 
 上游请求的连接由 `lib/transport.js` + `lib/proxy.js` 建立，按下面的顺序挑选路线，
 第一个能用就一直用（同一会话粘住；5 分钟后重新解析，解析到的代理会被记住）：
@@ -112,18 +117,18 @@
 
 | 组建 | 内容 |
 |---|---|
-| `contributes.providers` | ① `opencode-free`（`chat_completions`，8 个聊天通道免费模型）＋ ② `opencode-free-responses`（`responses`，Muse Spark 系列 2 个）——同一回环端点、每种线上协议各一个声明（commandcode 规则：一个 provider 只绑一种协议） |
+| `contributes.providers` | ① `opencode-free`（`chat_completions`，只放协议目录标记为 chat 的免费模型）；② 若发现 Responses 模型则追加 `opencode-free-responses`——同一回环端点、每种线上协议各一个声明（一个 provider 只绑一种协议） |
 | `contributes.services` | `zen-proxy`——loopback 代理（`/healthz`、`/proxy`、`/v1/models`、`/v1/chat/completions`、`/v1/responses`） |
 | `contributes.settings` | `proxyUrl`——上游代理（auto / off / 具体地址） |
 | `contributes.commands` | 「刷新模型目录」「显示状态」两个命令（toast 报告目录状态、当前上游与是否需要重载） |
 
 每个模型声明携带 models.dev 的真实元数据：`contextWindow` / `maxTokens` /
-**`supportsImages`**（`modalities.input` 含 `image`——mimo 双子、space-bunny、muse
-为 true，其余 false）、**`thinkingLevels`**（`reasoning_options` 的 effort 阶梯；
-space-bunny 是 low→max，muse 是 minimal→xhigh）——宿主据此生成每个模型的思考菜单。
+**`supportsImages`**（由 `modalities.input` 是否含 `image` 决定）、
+**`thinkingLevels`**（由 `reasoning_options` 的 effort 阶梯生成）——宿主据此生成
+每个模型的思考菜单。
 
-`muse-spark-*` 在 Zen 上**只答 `/v1/responses`**（OpenAI Responses 线格式），放进
-chat provider 就是选择器里的坏项，因此单独成列；loopback 对该 lane 强制 `stream: true`
+协议分流来自 OpenCode 模型目录与文档端点表，而不是名称前缀猜测。标记为
+`responses` 的免费模型会进入独立 provider；loopback 对该 lane 强制 `stream: true`
 并补上同一套门禁工具（**扁平** Responses 形状 `{type,name,description,parameters}`，
 不是 chat 的嵌套形状），其余原样透传到 Zen 自己的 `/v1/responses`（关联头按 `input`
 字段派生，与 chat 的 `messages` 对同一对话得到同一 `ses_`）。
@@ -148,7 +153,7 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
   且那 12 位十六进制必须是官方**倒序时间戳**编码（低 12 位落在 `0xFC0–0xFFF`，正则
   `^[0-9a-f]{9}f[c-f][0-9a-f]$`）。时间部分按对话记忆化铸造为真实倒序时钟，
   同一对话的重试与后续轮次继续复用同一个会话。
-- **免费通道请求形状（两条 lane 都要；上游 2026-10-14 收紧过，0.5.4 已按新规则对齐）**——
+- **免费通道请求形状（两条 lane 都要；已按上游当前规则对齐）**——
   匿名免费流量走 `https://opencode.ai/inference`（`/zen/*` 现在对无密钥请求一律
   `403 FreeTierError`），而且上游会逐项核对"你是不是官方客户端"：
   - 请求体必须流式；
@@ -165,8 +170,9 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 - **思考档位归一**——档位由宿主写（宿主读取声明的 `thinkingLevels` 生成菜单并写入
   `reasoning_effort`）。未选择时完全省略该字段；只有显式 `off`/`none` 才写
   `"none"`；合法档位原样透传，非法值不注入。
-- **流式与非流式响应**——`stream: true` 时逐块透传，并在上游异常结束时补发
-  `upstream_error` 与 `[DONE]`；`stream: false` 时把上游 SSE 重新组装成完整 JSON。
+- **流式与非流式响应**——`stream: true` 时按完整 SSE 帧解析，工具调用分片先缓冲再
+  重写；正常终止原样结束，文本已输出但上游提前断开时补截断提示，其余异常返回明确错误。
+  `stream: false` 时用同一协议解析器聚合成完整 JSON。
 - **连接层**（`lib/transport.js` + `lib/proxy.js`）——代理隧道 / 直连 / 公共 DNS 兜底，
   见上文「上游代理」。
 - 未移植（有意为之）：IP 池/代理轮换子系统（配额规避）、legacy Go sidecar。
@@ -178,7 +184,7 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 1. 插件页 **Load development plugin** 指向本目录（含 `manifest.json` 的那一层，即仓库根目录）。
 2. **权限已从 `agent.extension` 换为 `provider.register` + `background.service`，
    必须在插件页显式重载并重新授权**（权限变化不会由热重载放大）。
-   v0.5 的代理能力**没有新增任何权限**：隧道用 `node:net`/`node:tls` 自己实现，
+   代理能力**没有新增任何权限**：隧道用 `node:net`/`node:tls` 自己实现，
    系统代理经 `reg.exe` 读取（读不到就退化为端口探测，不影响可用性）。
 3. 重载后回到聊天窗：模型选择器应出现 **OpenCode免费模型** 分组及免费模型，
    **直接像内置模型一样选择对话**（无需任何命令切换）。
@@ -191,7 +197,7 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 | 步骤 | 工具 | 产物 |
 |---|---|---|
 | 校验 | `PluginCheck` | 按安装器同款规则报错/警告 |
-| 打包 | `PluginPack` | `dist/com.opencode2pi-0.5.0.piplug`（store-only zip；`.git`/`node_modules`/`dist` 自动排除，<2000 文件、<50 MB、无符号链接） |
+| 打包 | `PluginPack` | `dist/*.piplug`（store-only zip；`.git`/`node_modules`/`dist` 自动排除，<2000 文件、<50 MB、无符号链接） |
 | 安装 | 插件页 → 头部溢出菜单 → **「安装插件包」** | 选中 `.piplug` 文件即装（与「加载开发插件」的目录方式无关） |
 
 ### 权限说明
@@ -209,6 +215,6 @@ chat provider 就是选择器里的坏项，因此单独成列；loopback 对该
 
 - [opencode2dsh](https://github.com/FishBottle7/opencode2dsh)（MIT，© FishBottle7），没有它我就不会想到可以这么弄。
 - [pi-commandcode-desktop](https://github.com/eric8bit/pi-commandcode-desktop)（MIT），provider能力是参考它实现的。
-- [opencode2api](https://github.com/jasonxu114514/opencode2api)，上游匿名通道实现的源头，配享太庙；它 2026-10-14 那轮"镜像官方客户端指纹"的修复（端点、会话 id 编码、头集合、官方工具定义）是 0.5.4 的直接依据，`lib/opencode-tools.json` 内嵌的定义即取自其镜像的官方客户端定义（描述与参数 schema 逐字节保留）。
+- [opencode2api](https://github.com/jasonxu114514/opencode2api)，上游匿名通道实现的源头，配享太庙；其"镜像官方客户端指纹"的修复（端点、会话 id 编码、头集合、官方工具定义）是当前门禁实现的直接依据，`lib/opencode-tools.json` 内嵌的定义即取自其镜像的官方客户端定义（描述与参数 schema 逐字节保留）。
 - [OpenCode](https://opencode.ai)，免费匿名 Zen 通道的提供方。
 - [LinuxDO](https://linux.do/)，感谢l站各位佬的帖子给了我灵感 ~~*（虽然具体是哪些帖子已经找不到了）*~~。

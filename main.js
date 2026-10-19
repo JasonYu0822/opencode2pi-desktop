@@ -43,6 +43,13 @@ const path = require('node:path');
 
 const zen = require('./lib/zen.js');
 const proxyLib = require('./lib/proxy.js');
+const { encodeEvent, framesFrom, rewriteFrame } = require('./lib/sse.js');
+const { ProtocolError, analyzeFrame, collectSse } = require('./lib/protocol.js');
+const {
+  createChatStreamGuard,
+  createResponsesStreamGuard,
+  nameGuard,
+} = require('./lib/tool-policy.js');
 const { createUpstreamTransport, describeError } = require('./lib/transport.js');
 
 const SERVICE_ID = 'zen-proxy';
@@ -68,6 +75,8 @@ const UPSTREAM_HEADER_TIMEOUT_MS = 60_000;
  * into a retryable error instead of an indefinite host wait.
  */
 const UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+/** Cap the memory a non-streaming aggregate can consume from one response. */
+const UPSTREAM_AGGREGATE_BYTES_LIMIT = 32 * 1024 * 1024;
 /**
  * How long the transport may spend waiting out failed proxy dials before it
  * reports `ENOROUTE`. Deliberately below the header timeout above, so the chat
@@ -447,12 +456,59 @@ function handleRequest(req, res) {
     : '/v1/chat/completions');
 }
 
+const DROPPED_UPSTREAM_HEADERS = new Set([
+  'connection',
+  'content-encoding',
+  'content-length',
+  'content-type',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+/** Copy end-to-end upstream headers without stale framing or content metadata. */
+function forwardedHeaders(response, contentType) {
+  const headers = {};
+  response.headers.forEach((value, key) => {
+    if (!DROPPED_UPSTREAM_HEADERS.has(key.toLowerCase())) headers[key] = value;
+  });
+  headers['Content-Type'] = contentType || response.headers.get('content-type') || 'application/json';
+  return headers;
+}
+
+function failureBody(protocol, message) {
+  return { error: { type: 'upstream_error', message } };
+}
+
+function failureFrame(protocol, message) {
+  return protocol === 'responses'
+    ? encodeEvent({ type: 'error', code: 'upstream_error', message }, 'error')
+    : encodeEvent({ error: { type: 'upstream_error', message } });
+}
+
+function errorText(error, fallback = 'upstream response failed') {
+  if (error && typeof error.message === 'string' && error.message) return error.message;
+  return fallback;
+}
+
+async function streamToString(stream) {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let text = '';
+  for await (const chunk of stream) {
+    text += decoder.decode(chunk, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
 /**
- * Proxy one chat or Responses turn to Zen. Streaming responses pass through
- * chunk by chunk; non-streaming responses are reassembled into one JSON
- * document. The request shaping differs by dialect:
- *   chat      -> stream, reasoning_effort normalization, official tool gate
- *   responses -> stream, flat official tools, no tool_choice
+ * Proxy one chat or Responses turn to Zen. The upstream request is always
+ * streamed so the free lane accepts it. A non-streaming host receives one
+ * aggregated JSON object; a streaming host receives parsed and validated SSE
+ * frames, with split tool calls buffered until they can be renamed safely.
  */
 async function handleUpstream(req, res, upstreamPath) {
   let hostBody;
@@ -465,12 +521,10 @@ async function handleUpstream(req, res, upstreamPath) {
     return;
   }
 
-  // Lane shaping — both lanes force streaming and satisfy the free-lane body
-  // gate with the official client tool definitions:
-  //   chat      -> buildUpstreamBody (stream, reasoning_effort, gate tools)
-  //   responses -> the gate tools in the flat Responses shape, and no
-  //                tool_choice override: that provider only accepts "auto"
   const isResponsesLane = upstreamPath.endsWith('/responses');
+  const protocol = isResponsesLane ? 'responses' : 'chat';
+  // Capture host names before the free-lane gate injects official tools.
+  const checkName = nameGuard(zen.declaredToolNames(hostBody, protocol));
   const body = isResponsesLane
     ? zen.ensureFreeLaneShape({ ...hostBody, stream: true }, { dialect: 'responses' })
     : zen.buildUpstreamBody(hostBody);
@@ -495,17 +549,14 @@ async function handleUpstream(req, res, upstreamPath) {
     sendJson(res, 503, { error: { message: state.lastError } });
     return;
   }
+
   try {
-    // The free lanes live on the anonymous endpoint since 2026-10-14; /zen is
-    // the keyed path now and answers 403 FreeTierError for keyless requests.
     const response = await upstreamFetch(`${zen.ANONYMOUS_BASE_URL}${upstreamPath}`, {
       method: 'POST',
       headers: {
         ...zen.disguiseHeaders(ids),
         authorization: `Bearer ${zen.ANONYMOUS_KEY}`,
         'content-type': 'application/json',
-        // The client's own Accept spelling — the anonymous lane is strict about
-        // the request shape it fingerprints (see lib/zen.js ANONYMOUS_BASE_URL).
         accept: 'application/json, text/event-stream',
       },
       body: JSON.stringify(body),
@@ -518,11 +569,7 @@ async function handleUpstream(req, res, upstreamPath) {
       state.errors += 1;
       state.lastError = zen.extractErrorMessage(bodyText, response.status);
       log(`upstream ${response.status}: ${state.lastError.slice(0, 200)}`);
-      if (!res.headersSent) {
-        res.writeHead(response.status, {
-          'Content-Type': response.headers.get('content-type') || 'application/json',
-        });
-      }
+      if (!res.headersSent) res.writeHead(response.status, forwardedHeaders(response));
       res.end(bodyText);
       return;
     }
@@ -533,50 +580,68 @@ async function handleUpstream(req, res, upstreamPath) {
       return;
     }
 
-    // The anonymous lane forces the upstream request to stream, but the host
-    // decides the response. A client that sent `stream: false` expects one JSON
-    // object; piping SSE fragments at it makes it fail to parse (issue #3).
+    const contentType = response.headers.get('content-type') || '';
+    const isSse = contentType.toLowerCase().includes('text/event-stream');
+
     if (hostBody.stream !== true) {
-      const text = await streamToString(upstream);
-      const payload = isResponsesLane
-        ? reassembleResponsesSse(text, hostBody.model)
-        : reassembleChatSse(text);
-      sendJson(res, 200, payload);
+      if (!isSse) {
+        const text = await streamToString(upstream);
+        if (!res.headersSent) {
+          res.writeHead(response.status, forwardedHeaders(response, contentType || 'application/json'));
+        }
+        res.end(text);
+        return;
+      }
+      try {
+        const payload = await collectSse(upstream, protocol, {
+          checkName,
+          defaultModel: hostBody.model,
+          maxTotalBytes: UPSTREAM_AGGREGATE_BYTES_LIMIT,
+          readTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+        });
+        sendJson(res, 200, payload, forwardedHeaders(response, 'application/json; charset=utf-8'));
+      } catch (error) {
+        const message = errorText(error);
+        state.errors += 1;
+        state.lastError = `upstream ${protocol} protocol error: ${message}`;
+        log(state.lastError);
+        sendJson(
+          res,
+          502,
+          failureBody(protocol, message),
+          forwardedHeaders(response, 'application/json; charset=utf-8'),
+        );
+      }
       return;
     }
 
-    // The host asked for a stream: pass it through chunk by chunk. The relay
-    // inspects bytes without rewriting them so a dead upstream still produces
-    // an explicit error frame and a terminal [DONE] marker.
+    if (!isSse) {
+      throw new ProtocolError(`Upstream returned ${contentType || 'an unknown content type'} instead of an event stream`);
+    }
+
     res.writeHead(response.status, {
-      'Content-Type': response.headers.get('content-type') || 'text/event-stream',
+      ...forwardedHeaders(response, contentType || 'text/event-stream; charset=utf-8'),
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
     });
+
+    const chatGuard = protocol === 'chat' ? createChatStreamGuard(checkName) : null;
+    const responsesGuard = protocol === 'responses' ? createResponsesStreamGuard(checkName) : null;
     let clientGone = false;
-    let sawDone = false;
+    let completed = false;
     let sawFinish = false;
-    let sawResponseCompleted = false;
-    let tailProbe = '';
+    let abortReason = '';
     let idleTimer = null;
+
     const armIdle = () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         if (clientGone) return;
-        state.lastError = `upstream was silent for ${UPSTREAM_IDLE_TIMEOUT_MS}ms`;
-        log(state.lastError);
+        abortReason = `upstream was silent for ${UPSTREAM_IDLE_TIMEOUT_MS}ms`;
+        state.lastError = abortReason;
+        log(abortReason);
         controller.abort();
       }, UPSTREAM_IDLE_TIMEOUT_MS);
-    };
-    const finish = (errorMessage) => {
-      clearTimeout(idleTimer);
-      if (clientGone || res.writableEnded) return;
-      if (!sawDone && !sawFinish && !sawResponseCompleted) {
-        const message = errorMessage ?? 'upstream closed the stream before completing';
-        res.write(`data: ${JSON.stringify({ error: { message, type: 'upstream_error' } })}\n\n`);
-      }
-      if (!sawDone && !sawResponseCompleted) res.write('data: [DONE]\n\n');
-      res.end();
     };
     const waitForDrain = () => new Promise((resolve) => {
       const done = () => {
@@ -587,142 +652,111 @@ async function handleUpstream(req, res, upstreamPath) {
       res.once('drain', done);
       res.once('close', done);
     });
+    const writeText = async (text) => {
+      if (clientGone || res.writableEnded || !text) return false;
+      if (!res.write(text) && !clientGone) await waitForDrain();
+      return !clientGone;
+    };
+    const failStream = async (error) => {
+      if (clientGone || res.writableEnded) return;
+      const message = abortReason || errorText(error);
+      state.errors += 1;
+      state.lastError = `upstream ${protocol} stream failed: ${message}`;
+      log(state.lastError);
+      await writeText(failureFrame(protocol, message));
+      if (protocol === 'chat') await writeText('data: [DONE]\n\n');
+      if (!res.writableEnded) res.end();
+    };
 
     res.on('close', () => {
       clientGone = true;
       clearTimeout(idleTimer);
-      upstream.destroy();
     });
 
     armIdle();
     try {
-      for await (const chunk of upstream) {
+      for await (const frame of framesFrom(upstream)) {
         armIdle();
-        const text = chunk.toString('utf8');
-        tailProbe = (tailProbe + text).slice(-160);
-        if (tailProbe.includes('[DONE]')) sawDone = true;
-        if (/"finish_reason"\s*:\s*"[a-z_]+"/.test(tailProbe)) sawFinish = true;
-        if (/"type"\s*:\s*"response\.completed"/.test(tailProbe)) sawResponseCompleted = true;
-        if (!res.write(chunk) && !clientGone) await waitForDrain();
+        if (clientGone) break;
+        if (frame.name !== 'error' && !frame.text.trim()) {
+          if (!await writeText(frame.raw)) break;
+          continue;
+        }
+
+        const event = analyzeFrame(frame, protocol);
+        if (event.kind === 'empty') continue;
+        if (event.kind === 'done') {
+          if (chatGuard) {
+            const tail = chatGuard.finish();
+            if (tail) await writeText(encodeEvent(tail));
+          }
+          await writeText(frame.raw);
+          completed = true;
+          break;
+        }
+
+        if (protocol === 'chat') {
+          if (event.data.choices?.some((choice) => choice?.finish_reason != null)) sawFinish = true;
+          const guarded = chatGuard.apply(event.data);
+          if (guarded && !await writeText(rewriteFrame(frame, guarded))) break;
+        } else {
+          const guarded = responsesGuard.apply(event.data, event.type);
+          if (guarded.data) {
+            const output = guarded.changed ? rewriteFrame(frame, guarded.data) : frame.raw;
+            if (!await writeText(output)) break;
+          }
+          for (const extra of guarded.extra) {
+            if (!await writeText(encodeEvent(extra, extra.type))) break;
+          }
+          if (event.terminal) {
+            completed = true;
+            break;
+          }
+        }
       }
-      finish(null);
+
+      if (clientGone) return;
+      if (completed) {
+        clearTimeout(idleTimer);
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      if (protocol === 'chat' && !chatGuard.hasPendingTools && chatGuard.hasVisibleOutput) {
+        const ending = chatGuard.cutShortEnding();
+        if (ending) await writeText(encodeEvent(ending));
+        else if (!sawFinish) {
+          throw new ProtocolError('Upstream chat stream ended before a finish reason');
+        }
+        if (await writeText('data: [DONE]\n\n')) {
+          state.lastError = 'upstream chat stream was cut short; a visible notice was added';
+          clearTimeout(idleTimer);
+          if (!res.writableEnded) res.end();
+          return;
+        }
+      }
+      throw new ProtocolError(
+        protocol === 'chat'
+          ? 'Upstream SSE ended before [DONE]'
+          : 'Upstream Responses SSE ended without a terminal event',
+      );
     } catch (error) {
-      const reason = error && error.message ? error.message : String(error);
-      state.errors += 1;
-      state.lastError = `upstream stream interrupted: ${reason}`;
-      log(state.lastError);
-      finish(`upstream stream interrupted: ${reason}`);
+      if (!clientGone) await failStream(error);
+    } finally {
+      clearTimeout(idleTimer);
     }
   } catch (error) {
     clearTimeout(headerTimer);
-    // Keep the underlying cause: a bare `fetch failed` is undiagnosable (it is
-    // how a poisoned DNS answer or a dead proxy used to reach the chat window).
+    // Keep the underlying cause: a bare `fetch failed` is undiagnosable.
     state.errors += 1;
     state.lastError = describeError(error);
     log(`proxy error: ${state.lastError}`);
     if (!res.headersSent) {
       sendJson(res, 502, { error: { message: `upstream request failed: ${state.lastError}` } });
     } else if (!res.writableEnded) {
-      res.end();
+      const message = state.lastError;
+      res.end(failureFrame(protocol, message));
     }
   }
-}
-
-function streamToString(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on('data', (chunk) => chunks.push(chunk));
-    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    stream.on('error', reject);
-  });
-}
-
-/**
- * Fold an upstream chat SSE stream back into one non-streaming chat.completion.
- * The anonymous lane requires the request to stream, but a client that did not
- * ask for a stream expects a single JSON object.
- */
-function reassembleChatSse(raw) {
-  let id = '';
-  let created = 0;
-  let model = '';
-  let content = '';
-  let reasoning = '';
-  let finishReason = '';
-  let usage;
-  for (const line of raw.split('\n')) {
-    const data = line.startsWith('data:') ? line.slice(5).trim() : '';
-    if (!data || data === '[DONE]') continue;
-    let chunk;
-    try { chunk = JSON.parse(data); } catch { continue; }
-    if (!id) {
-      id = chunk.id || '';
-      created = chunk.created || 0;
-      model = chunk.model || '';
-    }
-    const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-    if (delta) {
-      if (typeof delta.content === 'string') content += delta.content;
-      if (typeof delta.reasoning === 'string') reasoning += delta.reasoning;
-    }
-    const reason = chunk.choices && chunk.choices[0] && chunk.choices[0].finish_reason;
-    if (reason) finishReason = reason;
-    if (chunk.usage && typeof chunk.usage === 'object') usage = chunk.usage;
-  }
-  // Some models put the whole answer in `reasoning` and leave `content` empty.
-  if (!content && reasoning) content = reasoning;
-  const message = { role: 'assistant', content };
-  if (reasoning && content) message.reasoning_content = reasoning;
-  const out = {
-    id: id || 'chatcmpl-proxy',
-    object: 'chat.completion',
-    created: created || Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, message, finish_reason: finishReason || 'stop' }],
-  };
-  if (usage) out.usage = usage;
-  return out;
-}
-
-/** Fold an upstream responses SSE stream back into one response object. */
-function reassembleResponsesSse(raw, model) {
-  let text = '';
-  let completed;
-  for (const line of raw.split('\n')) {
-    const data = line.startsWith('data:') ? line.slice(5).trim() : '';
-    if (!data || data === '[DONE]') continue;
-    let event;
-    try { event = JSON.parse(data); } catch { continue; }
-    if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
-      text += event.delta;
-    } else if (event.type === 'response.completed' && event.response) {
-      completed = event.response;
-    }
-  }
-  if (completed) {
-    const output = Array.isArray(completed.output) ? completed.output : [];
-    const hasText = output.some((item) => Array.isArray(item && item.content)
-      && item.content.some((part) => part && part.type === 'output_text'));
-    if (!hasText) {
-      output.push({
-        type: 'message', role: 'assistant', status: 'completed',
-        content: [{ type: 'output_text', text }],
-      });
-      completed.output = output;
-    }
-    return completed;
-  }
-  return {
-    id: `resp_proxy_${Math.floor(Date.now() / 1000)}`,
-    object: 'response',
-    created_at: Math.floor(Date.now() / 1000),
-    status: 'completed',
-    model: model || '',
-    output: [{
-      type: 'message', role: 'assistant', status: 'completed',
-      content: [{ type: 'output_text', text }],
-    }],
-  };
 }
 
 /** Bind 127.0.0.1, preferring the fixed candidates so the manifest stays valid. */

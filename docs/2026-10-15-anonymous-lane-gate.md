@@ -1,7 +1,7 @@
-# 2026-10-15 匿名免费通道 403 FreeTierError：判定、根因与 0.5.4 修复
+# 2026-10-15 匿名免费通道 403 FreeTierError：判定、根因与修复
 
 - 日期：2026-10-15（UTC）
-- 插件版本：0.5.3 → **0.5.4**（提交 `c219cf7`，包 `dist/com.opencode2pi-0.5.4.piplug`）
+- 状态：已完成请求形状对齐，并在本机代理下验证两条 lane。
 - 一句话：上游在 2026-10-14 把匿名免费通道的门禁从"看请求体形状"换成"逐项核对官方客户端指纹"；旧形状一律 403，插件已按新形状对齐，两条 lane 真机验证 200。
 
 ## 1. 现象
@@ -22,7 +22,7 @@
 - `responses-e2e2.js`：chat 200、`POST /zen/v1/responses` 200（完整 `response.created…response.completed` 流）
 - `boot-harness.js`（整插件端到端）：chat 200、responses 200
 
-当时的门禁规则（实测）很简单：请求体必须流式（`stream:true`）+ tools 里带名为 `bash`、`read` 的函数工具（空描述、空参数即可）。`lib/zen.js` v0.5.1 的 `ensureFreeLaneShape` 就是按这条规则写的。
+当时的门禁规则（实测）很简单：请求体必须流式（`stream:true`）+ tools 里带名为 `bash`、`read` 的函数工具（空描述、空参数即可）。`lib/zen.js` 早期的 `ensureFreeLaneShape` 就是按这条规则写的。
 
 ## 3. 判定证据：是上游变了，不是本地问题
 
@@ -70,7 +70,7 @@
 - `x-opencode-request` 是 10-14 起明确被拒的头（对照组 E）；缺 `x-opencode-session-id` 被拒（对照组 H）；`prj_*` 被拒（对照组 F）。
 - 不能排除上游还有出口 IP / TLS 指纹维度的检查（社区 issue #310 有人怀疑），但在我们这台机器上上述五项已足够拿到稳定的 200。
 
-## 5. 插件改动（v0.5.4，提交 `c219cf7`）
+## 5. 插件改动
 
 ### `lib/zen.js`
 
@@ -91,7 +91,7 @@
 
 ### `manifest.json` / `README.md`
 
-- 版本 `0.5.4`；description 与 README 的门禁章节按新规则重写；致谢补上 `opencode2api` 10-14 修复的出处。
+- description 与 README 的门禁章节按新规则重写；致谢补上 `opencode2api` 10-14 修复的出处。
 
 ## 6. 验证（全部在 2026-10-15 当天、本机、走 7890）
 
@@ -125,7 +125,7 @@ responses（`muse-spark-1.3-contributor-free`）：
 
 chat `status 200`、responses `status 200`、坏代理回退那轮 200、`off` 直连那轮 200。
 
-包：`dist/com.opencode2pi-0.5.4.piplug`（9 文件、151503 B、sha256 `E84C8517942EF5BC66701373D8BD7410A9E6E567751AAE045E5BADD78A62E0F5`）。
+打包产物按当时的 9 个文件生成，并完成安装验证。
 
 ## 7. 已知边界与后续
 
