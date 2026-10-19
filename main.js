@@ -20,9 +20,19 @@
  *   - the live free-model catalog (S1 ∩ models.dev) rewrites the manifest's
  *     provider declaration; a change is surfaced as "reload the plugin once".
  *
- * Upstream requests use this process's native fetch on purpose: the host's
+ * Upstream requests go out through lib/transport.js on purpose: the host's
  * `net.fetch` bridge buffers the whole response as text, which would kill the
- * SSE stream (same reasoning as commandcode).
+ * SSE stream (same reasoning as commandcode). That transport keeps streaming
+ * and adds the piece a plugin process otherwise cannot have: a proxy route.
+ * PI-Desktop spawns plugin processes with a whitelisted environment, so
+ * HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NODE_USE_ENV_PROXY never arrive here,
+ * and `globalThis.fetch` therefore went straight out over the system resolver.
+ * On a machine where `opencode.ai` is DNS-poisoned (mainland China without a
+ * tunnel) every turn died as `fetch failed` -> 502. The transport resolves its
+ * own route (plugin setting -> env -> Windows system proxy -> common local
+ * ports -> direct) and dials it with CONNECT/SOCKS5, so only this plugin's
+ * upstream traffic takes the proxy — no host change, no TUN, no system DNS
+ * change.
  */
 
 'use strict';
@@ -30,11 +40,14 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
-const { Readable } = require('node:stream');
 
 const zen = require('./lib/zen.js');
+const proxyLib = require('./lib/proxy.js');
+const { createUpstreamTransport, describeError } = require('./lib/transport.js');
 
 const SERVICE_ID = 'zen-proxy';
+/** Plugin setting that decides the upstream route (see lib/proxy.js). */
+const PROXY_SETTING_KEY = 'proxyUrl';
 /** Catalog cache file name inside the plugin data directory. */
 const CATALOG_CACHE_FILE = 'catalog-cache.json';
 /**
@@ -49,6 +62,12 @@ const COMMANDS = {
 };
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const UPSTREAM_HEADER_TIMEOUT_MS = 60_000;
+/**
+ * How long the transport may spend waiting out failed proxy dials before it
+ * reports `ENOROUTE`. Deliberately below the header timeout above, so the chat
+ * error carries the transport's own explanation instead of a bare abort.
+ */
+const UPSTREAM_WAIT_BUDGET_MS = 35_000;
 
 let pi;
 let packageRoot = '';
@@ -58,6 +77,8 @@ let log = () => {};
 let catalog = null;
 let server = null;
 let serviceLog = () => {};
+/** Upstream transport (proxy-aware): created by startService. */
+let transport = null;
 
 const state = {
   /** Model entries currently published into the manifest. */
@@ -72,6 +93,10 @@ const state = {
   requests: 0,
   errors: 0,
   lastError: undefined,
+  /** Plugin settings (pi.plugin.getSettings) — the proxy route lives here. */
+  settings: {},
+  /** Last resolved upstream route, for /healthz and the status command. */
+  route: undefined,
 };
 
 // ---------------------------------------------------------------------------
@@ -242,6 +267,95 @@ function currentModelIds() {
   return zen.bootstrapModelEntries().map((entry) => entry.id);
 }
 
+// ---------------------------------------------------------------------------
+// Upstream route (proxy resolution)
+// ---------------------------------------------------------------------------
+
+/**
+ * The plugin setting decides the route; an empty value means "auto"
+ * (env -> Windows system proxy -> common local ports -> direct).
+ */
+function proxySettingValue() {
+  const value = state.settings?.[PROXY_SETTING_KEY];
+  return typeof value === 'string' ? value : '';
+}
+
+function proxyMode() {
+  const value = proxySettingValue().trim().toLowerCase();
+  if (proxyLib.DIRECT_SENTINELS.has(value)) return 'direct';
+  if (proxyLib.AUTO_SENTINELS.has(value)) return 'auto';
+  return 'manual';
+}
+
+function createTransport() {
+  return createUpstreamTransport({
+    resolveCandidates: () => proxyLib.resolveProxyCandidates({
+      setting: proxySettingValue(),
+      env: process.env,
+      log,
+    }),
+    // Once a proxy candidate exists the transport never dials directly (see
+    // dialList); this is only the ceiling for waiting on failed dials.
+    waitBudgetMs: UPSTREAM_WAIT_BUDGET_MS,
+    log,
+  });
+}
+
+/** What the transport/`/healthz` report about the current route. */
+async function routeSnapshot() {
+  if (!transport) return { status: 'stopped', setting: proxySettingValue(), mode: proxyMode() };
+  const info = await transport.state();
+  state.route = info.active ?? state.route;
+  return { status: 'ready', setting: proxySettingValue(), mode: proxyMode(), ...info };
+}
+
+/**
+ * Persist a proxy choice: a URL, or one of the `auto` / `off` sentinels.
+ * The value goes back to the host through `pi.plugin.setSettings` so it
+ * survives a reload, and the transport re-resolves immediately.
+ */
+async function setProxySetting(value) {
+  const next = value === undefined || value === null ? '' : String(value).trim();
+  const lower = next.toLowerCase();
+  if (next && !proxyLib.AUTO_SENTINELS.has(lower) && !proxyLib.DIRECT_SENTINELS.has(lower)) {
+    const parsed = proxyLib.parseProxyUrl(next);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+  }
+  state.settings = { ...state.settings, [PROXY_SETTING_KEY]: next };
+  let persisted = false;
+  let warning;
+  try {
+    if (pi && pi.plugin && typeof pi.plugin.setSettings === 'function') {
+      await pi.plugin.setSettings({ [PROXY_SETTING_KEY]: next });
+      persisted = true;
+    } else {
+      warning = 'the host plugin API does not expose setSettings: the choice lives in this session only';
+    }
+  } catch (error) {
+    warning = `the choice could not be stored in the plugin settings (${describeError(error)}): it lives in this session only`;
+    log(warning);
+  }
+  if (transport) await transport.refresh();
+  log(`proxy setting is now ${next === '' ? 'auto' : next}`);
+  return { ok: true, setting: next, persisted, warning };
+}
+
+async function sendHealthz(res) {
+  sendJson(res, 200, {
+    ok: true,
+    port: state.port,
+    models: currentModelIds().length,
+    responsesModels: state.responsesEntries.length,
+    source: state.source,
+    hostReloadRequired: state.hostReloadRequired,
+    catalog: catalog ? catalog.snapshot() : { status: 'pending' },
+    route: await routeSnapshot(),
+    requests: state.requests,
+    errors: state.errors,
+    lastError: state.lastError,
+  });
+}
+
 /** The loopback server: what PI-Desktop talks to, and what talks to Zen. */
 function handleRequest(req, res) {
   if (!isLoopbackHost(req.headers.host) || !isLoopbackOrigin(req.headers.origin)) {
@@ -253,18 +367,57 @@ function handleRequest(req, res) {
   const pathname = url.pathname;
 
   if (req.method === 'GET' && (pathname === '/healthz' || pathname === '/')) {
-    sendJson(res, 200, {
-      ok: true,
-      port: state.port,
-      models: currentModelIds().length,
-      responsesModels: state.responsesEntries.length,
-      source: state.source,
-      hostReloadRequired: state.hostReloadRequired,
-      catalog: catalog ? catalog.snapshot() : { status: 'pending' },
-      requests: state.requests,
-      errors: state.errors,
-      lastError: state.lastError,
+    void sendHealthz(res).catch((error) => {
+      sendJson(res, 500, { error: { message: describeError(error) } });
     });
+    return;
+  }
+
+  // Route diagnostics: what the plugin would dial right now, plus a live
+  // handshake against every candidate. GET is a report, POST sets the route.
+  if (pathname === '/proxy' && req.method === 'GET') {
+    void (async () => {
+      const candidates = await proxyLib.resolveProxyCandidates({
+        setting: proxySettingValue(),
+        env: process.env,
+      });
+      const checks = [];
+      for (const entry of candidates.candidates) {
+        checks.push(await proxyLib.checkCandidate(entry));
+      }
+      sendJson(res, 200, {
+        ok: true,
+        route: await routeSnapshot(),
+        candidates: candidates.candidates.map((entry) => ({ source: entry.source, url: entry.proxy?.url ?? null })),
+        notes: candidates.notes,
+        checks,
+      });
+    })().catch((error) => sendJson(res, 500, { error: { message: describeError(error) } }));
+    return;
+  }
+
+  if (pathname === '/proxy' && req.method === 'POST') {
+    void (async () => {
+      let payload;
+      try {
+        payload = JSON.parse(await readBody(req));
+      } catch (error) {
+        sendJson(res, 400, { error: { message: `request body is not valid JSON: ${describeError(error)}` } });
+        return;
+      }
+      const requested = payload?.url ?? payload?.setting ?? payload?.proxyUrl;
+      const result = await setProxySetting(requested);
+      if (!result.ok) {
+        sendJson(res, 400, { error: { message: result.error } });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        persisted: result.persisted,
+        warning: result.warning,
+        route: await routeSnapshot(),
+      });
+    })().catch((error) => sendJson(res, 500, { error: { message: describeError(error) } }));
     return;
   }
 
@@ -306,13 +459,16 @@ async function handleUpstream(req, res, upstreamPath) {
     return;
   }
 
-  // Lane shaping — chat: force streaming, normalize reasoning_effort, inject
-  // the bash/read gate tools; responses: force streaming only (muse-spark is
-  // served natively by Zen's own /v1/responses). Everything else the host
-  // sent is forwarded untouched.
+  // Lane shaping — both lanes force streaming and satisfy the free-lane body
+  // gate (function tools named bash AND read; re-probed on /v1/responses
+  // 2026-10-08, where the same FreeTierError appeared until the gate tools were
+  // present):
+  //   chat      -> buildUpstreamBody (stream, reasoning_effort, gate tools)
+  //   responses -> the gate tools in the flat Responses shape, and no
+  //                tool_choice override: that provider only accepts "auto"
   const isResponsesLane = upstreamPath.endsWith('/responses');
   const body = isResponsesLane
-    ? { ...hostBody, stream: true }
+    ? zen.ensureFreeLaneShape({ ...hostBody, stream: true }, { dialect: 'responses' })
     : zen.buildUpstreamBody(hostBody);
   const ids = zen.deriveRequestIDsFromWire(body);
 
@@ -327,14 +483,26 @@ async function handleUpstream(req, res, upstreamPath) {
   }, UPSTREAM_HEADER_TIMEOUT_MS);
 
   state.requests += 1;
+  const upstreamFetch = transport ? transport.fetch : null;
+  if (!upstreamFetch) {
+    clearTimeout(headerTimer);
+    state.errors += 1;
+    state.lastError = 'the upstream transport is not running';
+    sendJson(res, 503, { error: { message: state.lastError } });
+    return;
+  }
   try {
-    const response = await fetch(`${zen.ZEN_BASE_URL}${upstreamPath}`, {
+    // The free lanes live on the anonymous endpoint since 2026-10-14; /zen is
+    // the keyed path now and answers 403 FreeTierError for keyless requests.
+    const response = await upstreamFetch(`${zen.ANONYMOUS_BASE_URL}${upstreamPath}`, {
       method: 'POST',
       headers: {
         ...zen.disguiseHeaders(ids),
         authorization: `Bearer ${zen.ANONYMOUS_KEY}`,
         'content-type': 'application/json',
-        accept: 'text/event-stream',
+        // The client's own Accept spelling — the anonymous lane is strict about
+        // the request shape it fingerprints (see lib/zen.js ANONYMOUS_BASE_URL).
+        accept: 'application/json, text/event-stream',
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -362,11 +530,11 @@ async function handleUpstream(req, res, upstreamPath) {
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
     });
-    if (!response.body) {
+    const upstream = response.body;
+    if (!upstream) {
       res.end();
       return;
     }
-    const upstream = Readable.fromWeb(response.body);
     upstream.on('error', () => {
       if (!res.writableEnded) res.end();
     });
@@ -374,8 +542,10 @@ async function handleUpstream(req, res, upstreamPath) {
     upstream.pipe(res);
   } catch (error) {
     clearTimeout(headerTimer);
+    // Keep the underlying cause: a bare `fetch failed` is undiagnosable (it is
+    // how a poisoned DNS answer or a dead proxy used to reach the chat window).
     state.errors += 1;
-    state.lastError = error && error.message ? error.message : String(error);
+    state.lastError = describeError(error);
     log(`proxy error: ${state.lastError}`);
     if (!res.headersSent) {
       sendJson(res, 502, { error: { message: `upstream request failed: ${state.lastError}` } });
@@ -425,6 +595,9 @@ async function startService({ log: providedLog } = {}) {
     try { console.log(`[opencode-free] ${message}`); } catch { /* console may be unavailable */ }
   };
 
+  // The upstream transport must exist before the endpoint accepts anything:
+  // every request (chat lanes and the catalog) goes through it.
+  transport = createTransport();
   server = http.createServer(handleRequest);
   const port = await listen(state.declaredPort ? [state.declaredPort, ...PORT_CANDIDATES] : PORT_CANDIDATES);
   state.started = true;
@@ -439,7 +612,7 @@ async function startService({ log: providedLog } = {}) {
   // (models.dev cost 0/0, deprecation-first), 5-minute refresh. Seeded from
   // the on-disk cache first, so an offline start keeps the real list and
   // metadata instead of rewriting manifest.json down to the bootstrap.
-  catalog = zen.createCatalog((url, init) => globalThis.fetch(url, init), () => {
+  catalog = zen.createCatalog((url, init) => transport.fetch(url, init), () => {
     // Fires on every real catalog change (5-minute refresh included), so the
     // manifest tracks the live free list without anyone running a command.
     applyCatalog(state.port ?? port);
@@ -461,6 +634,7 @@ function stopService() {
     server.close();
     server = null;
   }
+  transport = null;
   state.started = false;
 }
 
@@ -478,6 +652,20 @@ async function toast(message, kind) {
   log(message);
 }
 
+/** One-line route summary for the status toast. */
+async function routeSummary() {
+  const snapshot = await routeSnapshot();
+  if (snapshot.status !== 'ready') return '上游 未就绪';
+  // `planned` is where the *next* request goes; `active` is only whatever
+  // answered last, so it is stale right after a setting change.
+  const route = snapshot.planned ?? snapshot.active;
+  if (!route) return `上游 未就绪（${snapshot.mode}）`;
+  if (!route.url) return `上游 直连（${snapshot.mode}）`;
+  const last = snapshot.active;
+  const stale = last && (last.url ?? null) !== route.url ? `，上次走 ${last.url ?? '直连'}` : '';
+  return `上游 ${route.url}（${route.source}）${stale}`;
+}
+
 function registerCommands() {
   pi.commands.register({
     id: COMMANDS.refresh,
@@ -489,11 +677,12 @@ function registerCommands() {
         await toast('OpenCode免费模型: 服务尚未启动', 'warning');
         return;
       }
+      await transport?.refresh();
       await catalog.refreshOnce();
       applyCatalog(state.port ?? PORT_CANDIDATES[0]);
       const ids = currentModelIds();
       const note = state.hostReloadRequired ? ' 模型列表已变化，请在插件页重载一次插件生效。' : '';
-      await toast(`OpenCode免费模型: ${ids.length} 个免费模型（${state.source}）.${note}`,
+      await toast(`OpenCode免费模型: ${ids.length} 个免费模型（${state.source}）· ${await routeSummary()}.${note}`,
         state.source === 'ready' ? 'info' : 'warning');
     },
   });
@@ -502,13 +691,14 @@ function registerCommands() {
     id: COMMANDS.status,
     title: 'OpenCode免费模型: 显示状态',
     category: 'AI',
-    keywords: ['opencode', 'zen', '状态', '诊断', 'status'],
+    keywords: ['opencode', 'zen', '状态', '诊断', 'proxy', '代理', 'status'],
     run: async () => {
       const snapshot = catalog ? catalog.snapshot() : { status: 'pending' };
       await toast(
         `OpenCode免费模型: 端口 ${state.port ?? '未启动'} · ${currentModelIds().length} 个模型 · `
-        + `目录 ${snapshot.status}${state.hostReloadRequired ? ' · 需重载插件' : ''}`
-        + `${state.lastError ? ` · 错误: ${state.lastError.slice(0, 80)}` : ''}`,
+        + `目录 ${snapshot.status}${state.hostReloadRequired ? ' · 需重载插件' : ''}\n`
+        + `${await routeSummary()}`
+        + `${state.lastError ? ` · 错误: ${state.lastError.slice(0, 120)}` : ''}`,
         state.hostReloadRequired || snapshot.status === 'pending' ? 'warning' : 'info',
       );
     },
@@ -557,6 +747,18 @@ module.exports = {
       }
     } catch { dataPath = ''; }
     if (!dataPath) dataPath = packageRoot;
+    // Plugin settings carry the upstream route: an empty value means "auto".
+    // `getSettings` is the host-owned store, so the choice survives a reload
+    // and can also be edited from the plugin's settings page.
+    try {
+      if (pi.plugin && typeof pi.plugin.getSettings === 'function') {
+        const settings = await pi.plugin.getSettings();
+        state.settings = settings && typeof settings === 'object' ? settings : {};
+      }
+    } catch (error) {
+      state.settings = {};
+      log(`plugin settings are unavailable: ${describeError(error)}`);
+    }
     // Seed from the manifest exactly as it is ON DISK. The development-plugin
     // file watcher reloads the plugin on every manifest.json write, so
     // re-declaring a different list at each startup (static five vs live
@@ -593,5 +795,15 @@ module.exports = {
     readDeclaredState,
     state,
     PORT_CANDIDATES,
+    proxySettingValue,
+    setProxySetting,
+    routeSnapshot,
+    createTransport,
+    sendHealthz,
+    handleRequest,
+    handleUpstream,
+    startService,
+    stopService,
+    setTransport: (value) => { transport = value; },
   },
 };
